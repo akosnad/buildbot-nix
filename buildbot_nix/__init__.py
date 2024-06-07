@@ -4,14 +4,14 @@ import os
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from buildbot.config.builder import BuilderConfig
 from buildbot.configurators import ConfiguratorBase
-from buildbot.interfaces import WorkerSetupError
+from buildbot.interfaces import IRenderable, WorkerSetupError
 from buildbot.locks import MasterLock
 from buildbot.plugins import schedulers, steps, util, worker
 from buildbot.process import buildstep, logobserver, remotecommand
@@ -22,6 +22,7 @@ from buildbot.secrets.providers.file import SecretInAFile
 from buildbot.steps.trigger import Trigger
 from buildbot.www.authz import Authz
 from buildbot.www.authz.endpointmatchers import EndpointMatcherBase, Match
+from zope.interface import implementer
 
 if TYPE_CHECKING:
     from buildbot.process.log import StreamLog
@@ -30,14 +31,9 @@ if TYPE_CHECKING:
 from twisted.internet import defer
 from twisted.logger import Logger
 
-from .common import (
-    slugify_project_name,
-)
+from .common import slugify_project_name
 from .gitea_projects import GiteaBackend, GiteaConfig
-from .github_projects import (
-    GithubBackend,
-    GithubConfig,
-)
+from .github_projects import GithubBackend, GithubConfig
 from .projects import GitBackend, GitProject
 from .secrets import read_secret_file
 
@@ -110,7 +106,13 @@ class BuildTrigger(Trigger):
                 triggered_schedulers.append((self.skipped_builds_scheduler, props))
                 continue
 
-            if job.get("isCached"):
+            cache_status = job.get("cacheStatus")
+            if not cache_status and job.get("isCached"):
+                cache_status = "cached"
+
+            if cache_status in ("local", "cached"):
+                if cache_status == "local":
+                    self.local_cached_builds.append(attr)
                 triggered_schedulers.append((self.skipped_builds_scheduler, props))
                 continue
 
@@ -441,6 +443,19 @@ class CachixConfig:
         return env
 
 
+@implementer(IRenderable)
+class GcRootPath:
+    def __init__(self, project: GitProject) -> None:
+        self.project = project
+
+    def getRenderingFor(self, props: Properties) -> str:  # noqa: N802
+        if props.getProperty("branch") == self.project.default_branch:
+            return util.Interpolate(
+                "/nix/var/nix/gcroots/per-user/buildbot-worker/%(prop:project)s/%(prop:attr)s"
+            )
+        return util.Interpolate("result-%(prop:attr)s")
+
+
 def nix_build_config(
     project: GitProject,
     worker_names: list[str],
@@ -448,6 +463,7 @@ def nix_build_config(
     outputs_path: Path | None = None,
 ) -> BuilderConfig:
     """Builds one nix flake attribute."""
+    gc_root_path = GcRootPath(project)
     factory = util.BuildFactory()
     factory.addStep(
         NixBuildCommand(
@@ -466,7 +482,7 @@ def nix_build_config(
                 str(60 * 20),
                 "--accept-flake-config",
                 "--out-link",
-                util.Interpolate("result-%(prop:attr)s"),
+                gc_root_path,
                 util.Interpolate("%(prop:drv_path)s^*"),
             ],
             # 3 hours, defaults to 20 minutes
@@ -478,7 +494,7 @@ def nix_build_config(
     if cachix:
         factory.addStep(
             steps.ShellCommand(
-                name="Upload cachix",
+                name="Upload cahix",
                 env=cachix.cachix_env(),
                 command=[
                     "cachix",
@@ -491,24 +507,9 @@ def nix_build_config(
 
     factory.addStep(
         steps.ShellCommand(
-            name="Register gcroot",
-            command=[
-                "nix-store",
-                "--add-root",
-                # FIXME: cleanup old build attributes
-                util.Interpolate(
-                    "/nix/var/nix/gcroots/per-user/buildbot-worker/%(prop:project)s/%(prop:attr)s",
-                ),
-                "-r",
-                util.Property("out_path"),
-            ],
-            doStepIf=lambda s: s.getProperty("branch") == project.default_branch,
-        ),
-    )
-    factory.addStep(
-        steps.ShellCommand(
             name="Delete temporary gcroots",
-            command=["rm", "-f", util.Interpolate("result-%(prop:attr)s")],
+            command=["rm", "-f", gc_root_path],
+            doStepIf=lambda s: s.getProperty("branch") != project.default_branch,
         ),
     )
     if outputs_path is not None:
