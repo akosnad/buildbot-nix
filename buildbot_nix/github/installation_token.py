@@ -3,11 +3,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from buildbot_nix.common import (
-    HttpResponse,
-    atomic_write_file,
-    http_request,
-)
+from twisted.logger import Logger
+
+from buildbot_nix.common import HttpResponse, atomic_write_file, http_request
+
+tlog = Logger()
 
 from .jwt_token import JWTToken
 from .repo_token import RepoToken
@@ -27,12 +27,25 @@ class InstallationToken(RepoToken):
     def _create_installation_access_token(
         jwt_token: JWTToken, installation_id: int
     ) -> HttpResponse:
-        return http_request(
-            f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-            data={},
-            headers={"Authorization": f"Bearer {jwt_token.get()}"},
-            method="POST",
-        )
+        last_exception: Exception | None = None
+
+        for retry in range(3):
+            try:
+                return http_request(
+                    f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+                    data={},
+                    headers={"Authorization": f"Bearer {jwt_token.get()}"},
+                    method="POST",
+                )
+                break
+            except Exception as exception:
+                tlog.warn(
+                    f"Getting an installation token from GitHub failed, exp: {jwt_token.exp}"
+                )
+                last_exception = exception
+
+        assert last_exception is not None, "We should have caught an exception here!"
+        raise last_exception
 
     @staticmethod
     def _generate_token(
