@@ -944,11 +944,11 @@ class NixConfigurator(ConfiguratorBase):
             self.config.post_build_steps.append(
                 steps.ShellCommand(
                     name="Upload cachix",
-                    env=self.cachix.cachix_env(),
+                    env=self.config.cachix.environment,
                     command=[
                         "cachix",
                         "push",
-                        self.cachix.name,
+                        self.config.cachix.name,
                         util.Interpolate("result-%(prop:attr)s"),
                     ],
                 )
